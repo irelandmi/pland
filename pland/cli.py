@@ -2,10 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+import time
 
-from .llm import agent_loop, chat, get_config
+from .llm import chat, get_config
 from .tools import execute_tool, get_tool_schemas
+
+log = logging.getLogger("pland")
+
+
+def _setup_logging(verbose: bool = False):
+	level = logging.DEBUG if verbose else logging.INFO
+	handler = logging.StreamHandler(sys.stderr)
+	handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+	logging.getLogger("pland").setLevel(level)
+	logging.getLogger("pland").addHandler(handler)
 
 
 def run_capture(args):
@@ -14,12 +26,15 @@ def run_capture(args):
 	config = get_config(args.provider, args.model)
 	messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-	# Initial LLM message
+	log.info("starting capture (provider=%s, model=%s)", config["provider"], config["model"])
+	t0 = time.monotonic()
+
 	resp = chat(config, messages)
 	messages.append({"role": "assistant", "content": resp["content"]})
+	log.debug("initial response in %.1fs", time.monotonic() - t0)
 	print(f"\n{resp['content']}\n")
 
-	# Conversation loop
+	turn = 0
 	while True:
 		try:
 			user_input = input("> ").strip()
@@ -30,28 +45,34 @@ def run_capture(args):
 		if not user_input:
 			continue
 
+		turn += 1
+		t1 = time.monotonic()
+
 		if user_input.lower() in ("done", "done.", "/done"):
 			messages.append({"role": "user", "content": FINALIZE_PROMPT})
 			resp = chat(config, messages)
 			prd = resp["content"]
 			messages.append({"role": "assistant", "content": prd})
+			log.info("finalized PRD in %.1fs (%d chars)", time.monotonic() - t1, len(prd))
+			log.info("total capture time: %.1fs, %d turns", time.monotonic() - t0, turn)
 			print(f"\n{prd}\n")
 
 			if args.output:
 				with open(args.output, "w") as f:
 					f.write(prd)
-				print(f"Written to {args.output}")
+				log.info("written to %s", args.output)
 			return
 
 		messages.append({"role": "user", "content": user_input})
 		resp = chat(config, messages)
 		messages.append({"role": "assistant", "content": resp["content"]})
+		log.debug("turn %d response in %.1fs", turn, time.monotonic() - t1)
 		print(f"\n{resp['content']}\n")
 
 
 def run_tickets(args):
 	import json
-	from .workflows.tickets import EXEC_SYSTEM, PLAN_PROMPT
+	from .workflows.tickets import PLAN_PROMPT
 
 	if args.prd_file == "-":
 		prd = sys.stdin.read()
@@ -60,20 +81,25 @@ def run_tickets(args):
 			prd = f.read()
 
 	if not prd.strip():
-		print("error: empty PRD", file=sys.stderr)
+		log.error("empty PRD")
 		sys.exit(1)
 
 	config = get_config(args.provider, args.model)
+	log.info("starting tickets (provider=%s, model=%s, prd=%d chars)", config["provider"], config["model"], len(prd))
+	t_total = time.monotonic()
 
-	# Phase 1: Plan (no tools, LLM reads full PRD and produces JSON plan)
-	print("Phase 1: Planning...", file=sys.stderr)
+	# Phase 1: Plan
+	log.info("phase 1: planning...")
+	t1 = time.monotonic()
 	resp = chat(config, [
 		{"role": "system", "content": PLAN_PROMPT},
 		{"role": "user", "content": prd},
 	])
 	plan_text = resp["content"].strip()
+	plan_time = time.monotonic() - t1
+	log.info("phase 1 complete in %.1fs (%d chars response)", plan_time, len(plan_text))
 
-	# Extract JSON from response (may be wrapped in markdown or preamble text)
+	# Extract JSON
 	if "{" in plan_text:
 		start = plan_text.find("{")
 		end = plan_text.rfind("}") + 1
@@ -83,34 +109,39 @@ def run_tickets(args):
 	try:
 		plan = json.loads(plan_text)
 	except json.JSONDecodeError as e:
-		print(f"error: failed to parse plan JSON: {e}", file=sys.stderr)
-		print(plan_text[:500], file=sys.stderr)
+		log.error("failed to parse plan JSON: %s", e)
+		log.debug("response: %s", plan_text[:500])
 		sys.exit(1)
 
-	# Preview
 	epics = plan.get("epics", [])
 	total_tasks = sum(len(e.get("tasks", [])) for e in epics)
-	print(f"  {plan.get('project_name', '?')}: {len(epics)} epics, {total_tasks} tasks", file=sys.stderr)
+	log.info("plan: %s — %d epics, %d tasks, %d labels",
+		plan.get("project_name", "?"), len(epics), total_tasks, len(plan.get("labels", [])))
 
 	if args.dry_run:
 		print(json.dumps(plan, indent=2))
+		log.info("dry run — nothing created (%.1fs total)", time.monotonic() - t_total)
 		return
 
-	# Phase 2: Execute (tool calls with short messages)
-	print("Phase 2: Creating in taskd...", file=sys.stderr)
-	tools = get_tool_schemas()
-	ids: dict[str, str] = {}  # title/name -> real ID
+	# Phase 2: Execute
+	log.info("phase 2: creating in taskd...")
+	t2 = time.monotonic()
+	ids: dict[str, str] = {}
+	api_calls = 0
 
 	def exec_and_track(name: str, tool_args: dict) -> str:
+		nonlocal api_calls
+		t = time.monotonic()
 		result = execute_tool(name, tool_args)
-		# Extract ID from result like "created project 'X' (id: abc-123)"
+		elapsed = time.monotonic() - t
+		api_calls += 1
 		if "(id: " in result:
 			real_id = result.split("(id: ")[-1].rstrip(")")
 			key = tool_args.get("title") or tool_args.get("name") or ""
 			if key:
 				ids[key] = real_id
 		label = tool_args.get("title") or tool_args.get("name") or ""
-		print(f"  -> {name}({label}) = {result}", file=sys.stderr)
+		log.debug("  %s(%s) -> %s (%.0fms)", name, label, result, elapsed * 1000)
 		return result
 
 	# Create project
@@ -120,7 +151,7 @@ def run_tickets(args):
 	})
 	project_id = ids.get(plan.get("project_name", ""))
 	if not project_id:
-		print(f"error: failed to create project: {project_result}", file=sys.stderr)
+		log.error("failed to create project: %s", project_result)
 		sys.exit(1)
 
 	# Create labels
@@ -138,12 +169,12 @@ def run_tickets(args):
 			"description": epic.get("description", ""),
 		})
 
-	# Create tasks (need to resolve epic IDs and parent IDs)
+	# Create tasks
 	task_title_to_id: dict[str, str] = {}
 	for epic in epics:
 		epic_id = ids.get(epic["name"], "")
 		for task in epic.get("tasks", []):
-			result = exec_and_track("create_task", {
+			exec_and_track("create_task", {
 				"project_id": project_id,
 				"title": task["title"],
 				"description": task.get("description", ""),
@@ -171,15 +202,22 @@ def run_tickets(args):
 					})
 					dep_count += 1
 
-	# Summary
+	exec_time = time.monotonic() - t2
+	total_time = time.monotonic() - t_total
+
+	log.info("phase 2 complete in %.1fs (%d API calls)", exec_time, api_calls)
+	log.info("total: %.1fs (plan=%.1fs, exec=%.1fs)", total_time, plan_time, exec_time)
+
 	print(f"\nCreated project '{plan.get('project_name')}' ({project_id})")
 	print(f"  {len(plan.get('labels', []))} labels, {len(epics)} epics, {len(task_title_to_id)} tasks, {dep_count} dependencies")
+	print(f"  {total_time:.1f}s total (plan={plan_time:.1f}s, exec={exec_time:.1f}s, {api_calls} API calls)")
 
 
 def main():
 	parser = argparse.ArgumentParser(prog="pland", description="LLM-powered project planner for taskd")
 	parser.add_argument("--provider", default=None, help="LLM provider (anthropic, ollama)")
 	parser.add_argument("--model", default=None, help="model name")
+	parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
 
 	sub = parser.add_subparsers(dest="command", required=True)
 
@@ -191,6 +229,7 @@ def main():
 	tix.add_argument("--dry-run", action="store_true", help="show plan JSON without creating in taskd")
 
 	args = parser.parse_args()
+	_setup_logging(args.verbose)
 
 	if args.command == "capture":
 		run_capture(args)
