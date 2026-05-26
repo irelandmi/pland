@@ -4,30 +4,23 @@ from __future__ import annotations
 import argparse
 import sys
 
-from langchain_core.messages import HumanMessage
-from langgraph.types import Command
+from .llm import agent_loop, chat, get_config
+from .tools import execute_tool, get_tool_schemas
 
 
 def run_capture(args):
-	from .workflows.capture import build_capture_graph
+	from .workflows.capture import FINALIZE_PROMPT, SYSTEM_PROMPT
 
-	graph = build_capture_graph()
-	config = {"configurable": {"thread_id": "capture-1"}}
-	state = {"provider": args.provider, "model": args.model}
+	config = get_config(args.provider, args.model)
+	messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-	def print_latest_ai(result):
-		msgs = result.get("messages", [])
-		for msg in reversed(msgs):
-			if hasattr(msg, "type") and msg.type == "ai":
-				print(f"\n{msg.content}\n")
-				return
-
-	# Initial invocation — LLM sends first message
-	result = graph.invoke(state, config)
-	print_latest_ai(result)
+	# Initial LLM message
+	resp = chat(config, messages)
+	messages.append({"role": "assistant", "content": resp["content"]})
+	print(f"\n{resp['content']}\n")
 
 	# Conversation loop
-	while not result.get("done", False):
+	while True:
 		try:
 			user_input = input("> ").strip()
 		except (EOFError, KeyboardInterrupt):
@@ -37,23 +30,28 @@ def run_capture(args):
 		if not user_input:
 			continue
 
-		result = graph.invoke(Command(resume=user_input), config)
-		print_latest_ai(result)
+		if user_input.lower() in ("done", "done.", "/done"):
+			messages.append({"role": "user", "content": FINALIZE_PROMPT})
+			resp = chat(config, messages)
+			prd = resp["content"]
+			messages.append({"role": "assistant", "content": prd})
+			print(f"\n{prd}\n")
 
-	if result.get("prd"):
-		print("---")
-		print("PRD captured. You can pipe this into `pland plan`:")
-		if args.output:
-			with open(args.output, "w") as f:
-				f.write(result["prd"])
-			print(f"  Written to {args.output}")
-		else:
-			print("  Use --output <file> to save, or copy from above.")
+			if args.output:
+				with open(args.output, "w") as f:
+					f.write(prd)
+				print(f"Written to {args.output}")
+			return
+
+		messages.append({"role": "user", "content": user_input})
+		resp = chat(config, messages)
+		messages.append({"role": "assistant", "content": resp["content"]})
+		print(f"\n{resp['content']}\n")
 
 
-def run_plan(args):
-	from .schema import format_preview
-	from .workflows.plan import build_plan_graph
+def run_tickets(args):
+	import json
+	from .workflows.tickets import EXEC_SYSTEM, PLAN_PROMPT
 
 	if args.prd_file == "-":
 		prd = sys.stdin.read()
@@ -65,147 +63,117 @@ def run_plan(args):
 		print("error: empty PRD", file=sys.stderr)
 		sys.exit(1)
 
-	graph = build_plan_graph()
-	config = {"configurable": {"thread_id": "plan-1"}}
-	state = {
-		"prd": prd,
-		"dry_run": args.dry_run,
-		"auto_confirm": args.yes,
-		"provider": args.provider,
-		"model": args.model,
-	}
+	config = get_config(args.provider, args.model)
 
-	print("Generating plan...", file=sys.stderr)
-	result = graph.invoke(state, config)
+	# Phase 1: Plan (no tools, LLM reads full PRD and produces JSON plan)
+	print("Phase 1: Planning...", file=sys.stderr)
+	resp = chat(config, [
+		{"role": "system", "content": PLAN_PROMPT},
+		{"role": "user", "content": prd},
+	])
+	plan_text = resp["content"].strip()
 
-	if result.get("errors"):
-		print("Errors:", file=sys.stderr)
-		for e in result["errors"]:
-			print(f"  - {e}", file=sys.stderr)
+	# Extract JSON from response (may be wrapped in markdown or preamble text)
+	if "{" in plan_text:
+		start = plan_text.find("{")
+		end = plan_text.rfind("}") + 1
+		if start >= 0 and end > start:
+			plan_text = plan_text[start:end]
+
+	try:
+		plan = json.loads(plan_text)
+	except json.JSONDecodeError as e:
+		print(f"error: failed to parse plan JSON: {e}", file=sys.stderr)
+		print(plan_text[:500], file=sys.stderr)
 		sys.exit(1)
 
-	if result.get("preview"):
-		print(result["preview"])
-		print()
+	# Preview
+	epics = plan.get("epics", [])
+	total_tasks = sum(len(e.get("tasks", [])) for e in epics)
+	print(f"  {plan.get('project_name', '?')}: {len(epics)} epics, {total_tasks} tasks", file=sys.stderr)
 
 	if args.dry_run:
-		print("(dry run — nothing created)", file=sys.stderr)
+		print(json.dumps(plan, indent=2))
 		return
 
-	if result.get("committed"):
-		r = result["commit_result"]
-		print(f"Created project {r['project_id']}: {r['epic_count']} epics, {r['task_count']} tasks, {r['label_count']} labels")
-		return
+	# Phase 2: Execute (tool calls with short messages)
+	print("Phase 2: Creating in taskd...", file=sys.stderr)
+	tools = get_tool_schemas()
+	ids: dict[str, str] = {}  # title/name -> real ID
 
-	# Graph paused at confirm — ask user
-	if not args.yes:
-		try:
-			answer = input("Create this project? [y/N] ").strip()
-		except (EOFError, KeyboardInterrupt):
-			print("\nAborted.")
-			return
-		if answer.lower() != "y":
-			print("Aborted.")
-			return
+	def exec_and_track(name: str, tool_args: dict) -> str:
+		result = execute_tool(name, tool_args)
+		# Extract ID from result like "created project 'X' (id: abc-123)"
+		if "(id: " in result:
+			real_id = result.split("(id: ")[-1].rstrip(")")
+			key = tool_args.get("title") or tool_args.get("name") or ""
+			if key:
+				ids[key] = real_id
+		label = tool_args.get("title") or tool_args.get("name") or ""
+		print(f"  -> {name}({label}) = {result}", file=sys.stderr)
+		return result
 
-	result = graph.invoke(
-		Command(resume=None, update={"confirmed": True}),
-		config,
-	)
-
-	if result.get("errors"):
-		print("Errors:", file=sys.stderr)
-		for e in result["errors"]:
-			print(f"  - {e}", file=sys.stderr)
+	# Create project
+	project_result = exec_and_track("create_project", {
+		"name": plan.get("project_name", "Untitled"),
+		"description": plan.get("project_description", ""),
+	})
+	project_id = ids.get(plan.get("project_name", ""))
+	if not project_id:
+		print(f"error: failed to create project: {project_result}", file=sys.stderr)
 		sys.exit(1)
 
-	if result.get("committed"):
-		r = result["commit_result"]
-		print(f"Created project {r['project_id']}: {r['epic_count']} epics, {r['task_count']} tasks, {r['label_count']} labels")
+	# Create labels
+	for label in plan.get("labels", []):
+		exec_and_track("create_label", {
+			"name": label["name"],
+			"color": label.get("color", "#6b7280"),
+		})
 
+	# Create epics
+	for epic in epics:
+		exec_and_track("create_epic", {
+			"project_id": project_id,
+			"name": epic["name"],
+			"description": epic.get("description", ""),
+		})
 
-def run_revise(args):
-	from .workflows.revise import build_revise_graph
+	# Create tasks (need to resolve epic IDs and parent IDs)
+	task_title_to_id: dict[str, str] = {}
+	for epic in epics:
+		epic_id = ids.get(epic["name"], "")
+		for task in epic.get("tasks", []):
+			result = exec_and_track("create_task", {
+				"project_id": project_id,
+				"title": task["title"],
+				"description": task.get("description", ""),
+				"kind": task.get("kind", "task"),
+				"priority": task.get("priority", "medium"),
+				"epic_id": epic_id or None,
+				"labels": task.get("labels"),
+			})
+			if task["title"] in ids:
+				task_title_to_id[task["title"]] = ids[task["title"]]
 
-	graph = build_revise_graph()
-	config = {"configurable": {"thread_id": "revise-1"}}
-	state = {
-		"project_id": args.project,
-		"provider": args.provider,
-		"model": args.model,
-	}
+	# Wire up dependencies
+	dep_count = 0
+	for epic in epics:
+		for task in epic.get("tasks", []):
+			task_id = task_title_to_id.get(task["title"])
+			if not task_id:
+				continue
+			for dep_title in task.get("depends_on", []):
+				dep_id = task_title_to_id.get(dep_title)
+				if dep_id:
+					exec_and_track("add_dependency", {
+						"task_id": task_id,
+						"depends_on_id": dep_id,
+					})
+					dep_count += 1
 
-	result = graph.invoke(state, config)
-
-	if result.get("errors"):
-		print("Errors:", file=sys.stderr)
-		for e in result["errors"]:
-			print(f"  - {e}", file=sys.stderr)
-		sys.exit(1)
-
-	# Print LLM's initial assessment
-	for msg in result.get("messages", []):
-		if hasattr(msg, "content") and msg.type == "ai":
-			print(f"\n{msg.content}\n")
-
-	# Conversation loop
-	while not result.get("done", False) and not result.get("committed", False):
-		try:
-			user_input = input("> ").strip()
-		except (EOFError, KeyboardInterrupt):
-			print("\nAborted.")
-			return
-
-		if not user_input:
-			continue
-
-		result = graph.invoke(
-			Command(resume=HumanMessage(content=user_input)),
-			config,
-		)
-
-		if result.get("errors"):
-			print("Errors:", file=sys.stderr)
-			for e in result["errors"]:
-				print(f"  - {e}", file=sys.stderr)
-			if not result.get("revision"):
-				sys.exit(1)
-
-		for msg in result.get("messages", []):
-			if hasattr(msg, "content") and msg.type == "ai":
-				print(f"\n{msg.content}\n")
-
-		# If graph paused at apply, confirm
-		if result.get("revision") and not result.get("committed"):
-			rev = result["revision"]
-			print("Revision plan:")
-			if rev.add_tasks:
-				print(f"  Add {len(rev.add_tasks)} tasks")
-			if rev.update_tasks:
-				print(f"  Update {len(rev.update_tasks)} tasks")
-			if rev.add_dependencies:
-				print(f"  Add {len(rev.add_dependencies)} dependencies")
-			if rev.remove_dependencies:
-				print(f"  Remove {len(rev.remove_dependencies)} dependencies")
-
-			if not args.yes:
-				try:
-					answer = input("Apply revision? [y/N] ").strip()
-				except (EOFError, KeyboardInterrupt):
-					print("\nAborted.")
-					return
-				if answer.lower() != "y":
-					print("Aborted.")
-					return
-
-			result = graph.invoke(Command(resume=None), config)
-
-			if result.get("errors"):
-				print("Errors:", file=sys.stderr)
-				for e in result["errors"]:
-					print(f"  - {e}", file=sys.stderr)
-			if result.get("committed"):
-				print("Revision applied.")
+	# Summary
+	print(f"\nCreated project '{plan.get('project_name')}' ({project_id})")
+	print(f"  {len(plan.get('labels', []))} labels, {len(epics)} epics, {len(task_title_to_id)} tasks, {dep_count} dependencies")
 
 
 def main():
@@ -218,23 +186,16 @@ def main():
 	cap = sub.add_parser("capture", help="interactively build a PRD")
 	cap.add_argument("--output", "-o", help="write PRD to file")
 
-	plan = sub.add_parser("plan", help="decompose a PRD into a taskd project")
-	plan.add_argument("prd_file", help="path to PRD file (use - for stdin)")
-	plan.add_argument("--dry-run", action="store_true", help="preview without creating")
-	plan.add_argument("--yes", "-y", action="store_true", help="skip confirmation")
-
-	rev = sub.add_parser("revise", help="revise an existing project plan")
-	rev.add_argument("--project", "-p", required=True, help="taskd project ID")
-	rev.add_argument("--yes", "-y", action="store_true", help="skip confirmation")
+	tix = sub.add_parser("tickets", help="decompose a PRD into fleshed-out taskd tickets")
+	tix.add_argument("prd_file", help="path to PRD file (use - for stdin)")
+	tix.add_argument("--dry-run", action="store_true", help="show plan JSON without creating in taskd")
 
 	args = parser.parse_args()
 
 	if args.command == "capture":
 		run_capture(args)
-	elif args.command == "plan":
-		run_plan(args)
-	elif args.command == "revise":
-		run_revise(args)
+	elif args.command == "tickets":
+		run_tickets(args)
 
 
 if __name__ == "__main__":
