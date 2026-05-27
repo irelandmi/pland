@@ -88,30 +88,38 @@ def run_tickets(args):
 	log.info("starting tickets (provider=%s, model=%s, prd=%d chars)", config["provider"], config["model"], len(prd))
 	t_total = time.monotonic()
 
-	# Phase 1: Plan
-	log.info("phase 1: planning...")
-	t1 = time.monotonic()
-	resp = chat(config, [
-		{"role": "system", "content": PLAN_PROMPT},
-		{"role": "user", "content": prd},
-	])
-	plan_text = resp["content"].strip()
-	plan_time = time.monotonic() - t1
-	log.info("phase 1 complete in %.1fs (%d chars response)", plan_time, len(plan_text))
+	# Phase 1: Plan (with retry on JSON parse failure)
+	max_attempts = 3
+	plan = None
+	plan_time = 0.0
 
-	# Extract JSON
-	if "{" in plan_text:
-		start = plan_text.find("{")
-		end = plan_text.rfind("}") + 1
-		if start >= 0 and end > start:
-			plan_text = plan_text[start:end]
+	for attempt in range(1, max_attempts + 1):
+		log.info("phase 1: planning (attempt %d/%d)...", attempt, max_attempts)
+		t1 = time.monotonic()
+		resp = chat(config, [
+			{"role": "system", "content": PLAN_PROMPT},
+			{"role": "user", "content": prd},
+		])
+		plan_text = resp["content"].strip()
+		plan_time = time.monotonic() - t1
+		log.info("phase 1 attempt %d in %.1fs (%d chars response)", attempt, plan_time, len(plan_text))
 
-	try:
-		plan = json.loads(plan_text)
-	except json.JSONDecodeError as e:
-		log.error("failed to parse plan JSON: %s", e)
-		log.debug("response: %s", plan_text[:500])
-		sys.exit(1)
+		# Extract JSON
+		if "{" in plan_text:
+			start = plan_text.find("{")
+			end = plan_text.rfind("}") + 1
+			if start >= 0 and end > start:
+				plan_text = plan_text[start:end]
+
+		try:
+			plan = json.loads(plan_text)
+			break
+		except json.JSONDecodeError as e:
+			log.warning("attempt %d: failed to parse plan JSON: %s", attempt, e)
+			log.debug("response: %s", plan_text[:500])
+			if attempt == max_attempts:
+				log.error("all %d attempts failed to produce valid JSON", max_attempts)
+				sys.exit(1)
 
 	epics = plan.get("epics", [])
 	total_tasks = sum(len(e.get("tasks", [])) for e in epics)
